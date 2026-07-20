@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# GitHub Portfolio Analyzer - working/cache artifacts (regenerated on each run).
+# The final github_portfolio_report.md is intentionally NOT ignored here -
+# commit it yourself once you're happy with it.
+output/
+analyzer.log
+
+github_portfolio_report.md

@@ -1,0 +1,37 @@
+# Modelfile for the GitHub Portfolio Analyzer.
+#
+# This builds a custom Ollama model on top of the local Qwen2.5-Coder:14b
+# weights, permanently baking in the 32k context window the skeleton
+# pipeline needs (metadata + README + dependency files + directory tree can
+# get large for monorepos) and a low temperature suited to analytical /
+# structured-output tasks rather than creative writing.
+#
+# Build with:
+#   ollama create repo-analyzer-qwen -f Modelfile
+#
+# Base model must already be pulled:
+#   ollama pull qwen2.5-coder:14b
+
+FROM qwen2.5-coder:14b
+
+# 32768 tokens as specified. On a 16GB RTX 4080 Super this still leaves
+# enough VRAM headroom for the 14b weights (Q4/Q5 quantization) plus KV
+# cache; if you hit OOM, lower this to 16384 first.
+PARAMETER num_ctx 32768
+
+# Low temperature: we want consistent, deterministic-ish analysis and valid
+# JSON in steps 1/2, not creative variation between runs.
+PARAMETER temperature 0.2
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+
+SYSTEM """
+You are a precise senior software architect who analyzes source code
+repositories from limited, sometimes incomplete evidence (README excerpts,
+dependency manifests, a partial directory tree). Ground every statement in
+the evidence you are given. Never invent facts, filenames, version numbers,
+or metrics that were not provided. If the evidence is thin or ambiguous,
+say so explicitly instead of guessing. When asked to answer in JSON, output
+ONLY a single valid JSON object with exactly the requested keys - no markdown
+code fences, no commentary before or after it.
+"""
