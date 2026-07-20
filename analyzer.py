@@ -24,14 +24,22 @@ Design notes (why this differs slightly from a minimal 3-step script):
   given facts rather than *extract* them from noisy text first.
 - Per-repo caching: each repo's chapter is written to its own file under
   output/chapters/, keyed with a state.json entry storing the repo's
-  `pushed_at` timestamp. Re-running the script skips repos that haven't
-  changed since their last successful analysis, which matters a lot given
-  how slow 3x LLM calls per repo add up across a whole account. The final
-  report is reassembled from all chapter files after every repo, so it is
-  always complete and up to date even if the run is interrupted.
-- README-sparse fallback: many personal repos have a thin or missing
-  README. If so, a few of the largest non-test source files are sampled
-  as additional signal instead of letting the LLM analyze near-empty input.
+  `pushed_at` timestamp and a PIPELINE_VERSION. Re-running the script skips
+  repos that haven't changed since their last successful analysis (and
+  auto-invalidates the cache whenever the analysis pipeline itself changes),
+  which matters a lot given how slow 3x LLM calls per repo add up across a
+  whole account. The final report is reassembled from all chapter files
+  after every repo, so it is always complete and up to date even if the
+  run is interrupted.
+- Real language composition: GitHub's `languages` endpoint (the exact byte
+  counts behind the repo language bar in the GitHub UI) is used as ground
+  truth for the "Languages" row instead of letting the LLM guess from
+  prose, which used to produce "unknown" for repos with a thin README.
+- Always-on source sampling: a diversified slice of real source files
+  (entry points first, then files matching the repo's top languages,
+  capped per directory) is always included in the skeleton, not just as a
+  fallback for repos with a thin/missing README - so the LLM analyzes
+  actual code, not just metadata and prose.
 """
 
 from __future__ import annotations
@@ -78,22 +86,43 @@ DEPENDENCY_FILENAMES = {
 }
 MAX_DEPENDENCY_FILES = 6
 
-# Fallback source-file sampling (used only when the README is missing/thin).
+# Source-code sampling: always taken (not just when the README is thin), to
+# give the LLM real code instead of just prose to analyze. Selection is
+# diversified across entry points, top languages, and directories - see
+# pick_source_sample_paths().
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".rb",
     ".php", ".c", ".cpp", ".h", ".hpp", ".cs", ".kt", ".swift",
 }
 EXCLUDE_PATH_HINTS = ("test", "spec", "node_modules", "vendor", ".min.")
-FALLBACK_SAMPLE_MAX_FILES = 3
-FALLBACK_SAMPLE_MAX_CHARS = 2500
-README_MIN_MEANINGFUL_CHARS = 200
+ENTRY_POINT_NAMES = {
+    "main.py", "app.py", "manage.py", "index.js", "index.ts", "server.js",
+    "main.go", "program.cs", "main.rs",
+}
+# Maps GitHub's `languages` API names to file extensions, used only to bias
+# sampling toward the repo's actual top languages - not a hard filter.
+LANGUAGE_TO_EXTENSIONS = {
+    "Python": {".py"}, "JavaScript": {".js", ".jsx"}, "TypeScript": {".ts", ".tsx"},
+    "Go": {".go"}, "Rust": {".rs"}, "Java": {".java"}, "Ruby": {".rb"},
+    "PHP": {".php"}, "C": {".c", ".h"}, "C++": {".cpp", ".hpp"}, "C#": {".cs"},
+    "Kotlin": {".kt"}, "Swift": {".swift"},
+}
+SOURCE_SAMPLE_MAX_FILES = 8
+SOURCE_SAMPLE_MAX_CHARS = 4000
+MAX_FILES_PER_DIR = 2  # diversification cap so one folder can't dominate the sample
 
 # Context-budget caps for the skeleton (generous headroom under the 32k
-# context: worst case is roughly 6k + 8k + 4k + 7.5k chars =~ 7k tokens).
+# context: worst case is roughly 6k readme + 18k deps + 4k tree + 32k samples
+# =~ 60k chars =~ 17k tokens, leaving ~10-12k tokens for instructions/output).
 README_MAX_CHARS = 6000
 DEP_FILE_MAX_CHARS = 3000
 TREE_MAX_CHARS = 4000
 TREE_MAX_DEPTH = 3
+
+# Bumped whenever the analysis prompts/schema change, so cached chapters from
+# an older pipeline version are automatically reprocessed instead of silently
+# kept stale.
+PIPELINE_VERSION = 2
 
 # --------------------------------------------------------------------------
 # 2. GitHub API client
@@ -186,6 +215,13 @@ class GitHubClient:
         data = resp.json()
         return data.get("tree", []), bool(data.get("truncated", False))
 
+    def get_languages(self, owner: str, repo: str) -> dict[str, int]:
+        """Bytes of code per language - the exact same data behind GitHub's UI language bar."""
+        resp = self._get(f"{GITHUB_API}/repos/{owner}/{repo}/languages")
+        if resp.status_code != 200:
+            return {}
+        return resp.json()
+
     def get_file_content(self, owner: str, repo: str, path: str, max_bytes: int = 200_000) -> str | None:
         resp = self._get(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}")
         if resp.status_code != 200:
@@ -206,6 +242,15 @@ class GitHubClient:
 # --------------------------------------------------------------------------
 # 3. Skeleton construction (metadata + README + deps + tree, no source RAG)
 # --------------------------------------------------------------------------
+
+
+def format_language_breakdown(languages: dict[str, int]) -> str:
+    """Renders GitHub's byte-based language stats as "Python 88.4%, HTML 7.1%, ..."."""
+    total = sum(languages.values())
+    if not total:
+        return "not detected by GitHub"
+    parts = sorted(languages.items(), key=lambda kv: kv[1], reverse=True)
+    return ", ".join(f"{name} {100 * count / total:.1f}%" for name, count in parts)
 
 
 def compute_repo_signals(tree_entries: list[dict]) -> dict:
@@ -257,7 +302,15 @@ def find_dependency_files(tree_entries: list[dict]) -> list[str]:
     return matches[:MAX_DEPENDENCY_FILES]
 
 
-def pick_fallback_sample_paths(tree_entries: list[dict]) -> list[str]:
+def pick_source_sample_paths(tree_entries: list[dict], languages_bytes: dict[str, int]) -> list[str]:
+    """Picks a diverse slice of source files: known entry points first, then files
+    matching the repo's top languages, spread across directories rather than all
+    coming from whichever single folder happens to hold the biggest files."""
+    top_languages = [name for name, _ in sorted(languages_bytes.items(), key=lambda kv: kv[1], reverse=True)[:2]]
+    preferred_extensions: set[str] = set()
+    for lang in top_languages:
+        preferred_extensions |= LANGUAGE_TO_EXTENSIONS.get(lang, set())
+
     candidates = []
     for e in tree_entries:
         if e.get("type") != "blob":
@@ -269,14 +322,33 @@ def pick_fallback_sample_paths(tree_entries: list[dict]) -> list[str]:
         if any(hint in lower for hint in EXCLUDE_PATH_HINTS):
             continue
         candidates.append(e)
-    candidates.sort(key=lambda e: e.get("size", 0), reverse=True)
-    return [e["path"] for e in candidates[:FALLBACK_SAMPLE_MAX_FILES]]
+
+    def sort_key(e: dict) -> tuple:
+        basename = e["path"].split("/")[-1].lower()
+        is_entry_point = basename not in ENTRY_POINT_NAMES
+        matches_top_language = os.path.splitext(e["path"])[1] not in preferred_extensions
+        return (is_entry_point, matches_top_language, -e.get("size", 0))
+
+    candidates.sort(key=sort_key)
+
+    selected: list[str] = []
+    files_per_dir: dict[str, int] = {}
+    for e in candidates:
+        if len(selected) >= SOURCE_SAMPLE_MAX_FILES:
+            break
+        top_dir = e["path"].split("/")[0] if "/" in e["path"] else ""
+        if files_per_dir.get(top_dir, 0) >= MAX_FILES_PER_DIR:
+            continue
+        selected.append(e["path"])
+        files_per_dir[top_dir] = files_per_dir.get(top_dir, 0) + 1
+    return selected
 
 
 def build_skeleton(gh: GitHubClient, owner: str, name: str, repo_meta: dict) -> dict:
     tree_entries, truncated = gh.get_tree(owner, name, repo_meta.get("default_branch"))
 
     readme = (gh.get_readme(owner, name) or "").strip()
+    languages_bytes = gh.get_languages(owner, name)
 
     dependency_files: dict[str, str] = {}
     for path in find_dependency_files(tree_entries):
@@ -284,12 +356,14 @@ def build_skeleton(gh: GitHubClient, owner: str, name: str, repo_meta: dict) -> 
         if content:
             dependency_files[path] = content[:DEP_FILE_MAX_CHARS]
 
+    # Always sample source code (not just when the README is thin) so the LLM
+    # has real code to analyze instead of relying on prose/metadata alone.
     sample_files: dict[str, str] = {}
-    if len(readme) < README_MIN_MEANINGFUL_CHARS and tree_entries:
-        for path in pick_fallback_sample_paths(tree_entries):
+    if tree_entries:
+        for path in pick_source_sample_paths(tree_entries, languages_bytes):
             content = gh.get_file_content(owner, name, path)
             if content:
-                sample_files[path] = content[:FALLBACK_SAMPLE_MAX_CHARS]
+                sample_files[path] = content[:SOURCE_SAMPLE_MAX_CHARS]
 
     signals = compute_repo_signals(tree_entries)
     signals["readme_length"] = len(readme)
@@ -303,6 +377,8 @@ def build_skeleton(gh: GitHubClient, owner: str, name: str, repo_meta: dict) -> 
         "tree_text": build_tree_text(tree_entries) if tree_entries else "(empty or inaccessible)",
         "signals": signals,
         "is_empty_repo": not tree_entries,
+        "languages_bytes": languages_bytes,
+        "languages_text": format_language_breakdown(languages_bytes),
     }
 
 
@@ -329,10 +405,11 @@ AUDITOR_SYSTEM = (
 
 WRITER_SYSTEM = (
     "You are a technical writer turning structured repository analysis data "
-    "into the narrative body of one report chapter. Be concise and factual; "
-    "do not add information beyond what is given. Output clean Markdown "
-    "only, starting directly with a '### Summary' heading - no repository "
-    "title, no metadata table, and no surrounding code fences."
+    "into the narrative body of one report chapter. Be thorough and factual, "
+    "using the full detail given to you rather than compressing it into "
+    "generic filler; do not add information beyond what is given. Output "
+    "clean Markdown only, starting directly with a '### Summary' heading - "
+    "no repository title, no metadata table, and no surrounding code fences."
 )
 
 
@@ -362,6 +439,7 @@ def call_ollama_json(
     user_prompt: str,
     required_keys: list[str],
     defaults: dict,
+    num_predict: int | None = None,
 ) -> dict:
     """Calls Ollama with format="json" and retries once on malformed output
     before falling back to safe defaults, so one bad repo can't crash the run."""
@@ -369,13 +447,16 @@ def call_ollama_json(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+    options = {"num_ctx": OLLAMA_NUM_CTX, "temperature": 0.2}
+    if num_predict is not None:
+        options["num_predict"] = num_predict
     for attempt in range(2):
         try:
             response = client.chat(
                 model=model,
                 messages=messages,
                 format="json",
-                options={"num_ctx": OLLAMA_NUM_CTX, "temperature": 0.2},
+                options=options,
             )
             content = response["message"]["content"]
         except Exception as exc:  # local server hiccup, timeout, etc.
@@ -413,7 +494,8 @@ def step1_tech_parser(client: ollama.Client, model: str, repo_meta: dict, skelet
     )
 
     user_prompt = f"""Repository: {repo_meta['full_name']}
-Primary language (per GitHub): {repo_meta.get('language') or 'unknown'}
+Real language composition (ground truth from GitHub, by bytes of code - do not contradict this):
+{skeleton['languages_text']}
 
 Directory tree (depth <= {TREE_MAX_DEPTH}, common build/dependency folders filtered out):
 {skeleton['tree_text']}
@@ -423,25 +505,28 @@ Dependency / manifest files found:
 
 README (may be truncated, or absent):
 {skeleton['readme'] or '(no README found)'}
-{("Additional source file samples (used because the README was missing or too short):\n" + sample_section) if sample_section else ""}
+{("Sampled source files (a representative slice of the actual code, not the whole repo):\n" + sample_section) if sample_section else ""}
 
-Task: Based ONLY on the evidence above, identify the technology stack.
+Task: Based ONLY on the evidence above, identify the technology stack and how the code is organized.
 Respond with a single JSON object with exactly these keys:
-- "languages": array of programming languages actually evidenced
+- "languages": array of programming languages actually evidenced - must be consistent with the real language composition given above
 - "frameworks": array of frameworks/major libraries evidenced (empty array if none)
 - "libraries": array of other notable libraries/tools evidenced
 - "architecture_patterns": array of architecture patterns evidenced (e.g. "REST API", "CLI tool", "monorepo") - empty array if not evidenced
 - "project_type": one short string describing what kind of project this is
+- "architecture_notes": 2-4 sentences on how the code appears to be organized (module boundaries, entry points, separation of concerns) based on the tree and sampled files - say explicitly if the sample was too small to tell
 - "notes": short string with anything notable or ambiguous (empty string if nothing)
 If the evidence is too sparse to tell, use empty arrays and say so in "notes" - do not guess.
 """
     defaults = {
-        "languages": [repo_meta["language"]] if repo_meta.get("language") else [],
+        "languages": [name for name, _ in sorted(skeleton["languages_bytes"].items(), key=lambda kv: kv[1], reverse=True)]
+        or ([repo_meta["language"]] if repo_meta.get("language") else []),
         "frameworks": [],
         "libraries": [],
         "architecture_patterns": [],
         "project_type": "unknown",
-        "notes": "LLM analysis failed; falling back to the GitHub-reported primary language only.",
+        "architecture_notes": "LLM analysis failed; no architecture notes available.",
+        "notes": "LLM analysis failed; falling back to GitHub-reported language data only.",
     }
     return call_ollama_json(client, model, TECH_PARSER_SYSTEM, user_prompt, list(defaults.keys()), defaults)
 
@@ -472,9 +557,12 @@ Task: Assess this repository's maturity and technical health based ONLY on the e
 Respond with a single JSON object with exactly these keys:
 - "maturity": one of "PoC", "MVP", "Production", "Archived"
 - "complexity": one of "Low", "Medium", "High"
-- "technical_debt": array of short strings, concrete debt items evidenced (empty array if none evidenced)
-- "strengths": array of short strings (empty array if none evidenced)
-- "risks": array of short strings (empty array if none evidenced)
+- "technical_debt": array of full sentences, each stating a concrete debt item AND why it matters for
+  this specific repo (empty array if none evidenced) - do not write bare fragments like "No tests"
+- "strengths": array of full sentences (empty array if none evidenced)
+- "risks": array of full sentences (empty array if none evidenced)
+- "recommendations": array of concrete, actionable next steps for this repo specifically, ordered by
+  impact (empty array if the repo is already in good shape)
 - "confidence": one of "Low", "Medium", "High" - your confidence given how much evidence was available
 If the repository looks empty or the evidence is too sparse, set "maturity" to "PoC", "confidence" to "Low", and explain why in "technical_debt".
 """
@@ -484,9 +572,12 @@ If the repository looks empty or the evidence is too sparse, set "maturity" to "
         "technical_debt": ["LLM analysis failed; this is a placeholder assessment."],
         "strengths": [],
         "risks": [],
+        "recommendations": [],
         "confidence": "Low",
     }
-    return call_ollama_json(client, model, AUDITOR_SYSTEM, user_prompt, list(defaults.keys()), defaults)
+    return call_ollama_json(
+        client, model, AUDITOR_SYSTEM, user_prompt, list(defaults.keys()), defaults, num_predict=700
+    )
 
 
 def render_fallback_narrative(tech_json: dict, audit_json: dict) -> str:
@@ -496,16 +587,23 @@ def render_fallback_narrative(tech_json: dict, audit_json: dict) -> str:
         "### Summary",
         "",
         f"_Automated writer step failed; showing raw analysis._ Detected stack: {stack}.",
+    ]
+    if tech_json.get("architecture_notes"):
+        lines += ["", "### Architecture & Code Organization", "", tech_json["architecture_notes"]]
+    lines += [
         "",
         "### Assessment",
         f"Maturity: **{audit_json.get('maturity', 'unknown')}**, "
         f"Complexity: **{audit_json.get('complexity', 'unknown')}**, "
         f"Confidence: **{audit_json.get('confidence', 'unknown')}**",
     ]
+    if audit_json.get("strengths"):
+        lines += ["", "**Strengths**"] + [f"- {item}" for item in audit_json["strengths"]]
     debt_and_risks = audit_json.get("technical_debt", []) + audit_json.get("risks", [])
     if debt_and_risks:
-        lines += ["", "**Technical Debt & Risks**"]
-        lines += [f"- {item}" for item in debt_and_risks]
+        lines += ["", "**Technical Debt & Risks**"] + [f"- {item}" for item in debt_and_risks]
+    if audit_json.get("recommendations"):
+        lines += ["", "**Recommendations**"] + [f"- {item}" for item in audit_json["recommendations"]]
     return "\n".join(lines)
 
 
@@ -520,22 +618,29 @@ Maturity/quality assessment (JSON):
 {json.dumps(audit_json, ensure_ascii=False, indent=2)}
 
 Write the narrative body of this repository's report chapter in clean Markdown, using
-exactly these two subsections and nothing else:
+exactly these three subsections and nothing else:
 
 ### Summary
-2-4 sentences: what the project is/does and its tech stack, in plain prose.
+5-8 sentences covering: what the project actually does, its real tech stack (languages,
+frameworks, libraries), and its project type. Be specific and use the detail you were given
+instead of compressing it into generic filler.
+
+### Architecture & Code Organization
+2-4 sentences based on "architecture_notes" - how the code is organized, entry points,
+module boundaries. If architecture_notes says the evidence was too thin, say so briefly
+instead of inventing structure.
 
 ### Assessment
-A short paragraph on maturity, complexity and confidence, followed by bullet lists
-titled "Strengths" and "Technical Debt & Risks" (merge the technical_debt and risks
-arrays into the latter). Omit a list entirely if its source array was empty rather
-than inventing filler content.
+A paragraph on maturity, complexity and confidence, followed by bullet lists titled
+"Strengths", "Technical Debt & Risks" (merge technical_debt and risks) and
+"Recommendations" (from the recommendations array). Omit any list entirely if its
+source array was empty rather than inventing filler content.
 """
     try:
         response = client.chat(
             model=model,
             messages=[{"role": "system", "content": WRITER_SYSTEM}, {"role": "user", "content": user_prompt}],
-            options={"num_ctx": OLLAMA_NUM_CTX, "temperature": 0.3},
+            options={"num_ctx": OLLAMA_NUM_CTX, "temperature": 0.3, "num_predict": 900},
         )
         text = response["message"]["content"].strip()
         if text:
@@ -554,8 +659,7 @@ def safe_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
 
-def render_chapter(repo_meta: dict, tech_json: dict, audit_json: dict, narrative_body: str) -> str:
-    languages = ", ".join(tech_json.get("languages", [])) or (repo_meta.get("language") or "unknown")
+def render_chapter(repo_meta: dict, tech_json: dict, audit_json: dict, narrative_body: str, languages_text: str) -> str:
     frameworks = ", ".join(tech_json.get("frameworks", [])) or "-"
     table = (
         f"## {repo_meta['name']}\n\n"
@@ -563,7 +667,7 @@ def render_chapter(repo_meta: dict, tech_json: dict, audit_json: dict, narrative
         "|---|---|\n"
         f"| **URL** | {repo_meta['html_url']} |\n"
         f"| **Description** | {repo_meta.get('description') or '-'} |\n"
-        f"| **Primary Language** | {languages} |\n"
+        f"| **Languages** | {languages_text} |\n"
         f"| **Frameworks / Libraries** | {frameworks} |\n"
         f"| **Stars** | {repo_meta.get('stargazers_count', 0)} |\n"
         f"| **Last Push** | {repo_meta.get('pushed_at', 'unknown')} |\n"
@@ -649,6 +753,7 @@ def process_repo(
         and cached
         and cached.get("status") == "done"
         and cached.get("pushed_at") == repo_meta.get("pushed_at")
+        and cached.get("pipeline_version") == PIPELINE_VERSION
         and chapter_path.exists()
     ):
         return "cached"
@@ -668,15 +773,26 @@ def process_repo(
         chapter_path.write_text(
             render_error_chapter(repo_meta, "repository is empty (no commits / no default branch)"), encoding="utf-8"
         )
-        state[full_name] = {"status": "done", "pushed_at": repo_meta.get("pushed_at"), "analyzed_at": now_iso()}
+        state[full_name] = {
+            "status": "done",
+            "pushed_at": repo_meta.get("pushed_at"),
+            "analyzed_at": now_iso(),
+            "pipeline_version": PIPELINE_VERSION,
+        }
         return "empty"
 
     try:
         tech_json = step1_tech_parser(client, model, repo_meta, skeleton)
         audit_json = step2_auditor(client, model, repo_meta, skeleton, tech_json)
         narrative = step3_writer(client, model, repo_meta, tech_json, audit_json)
-        chapter_path.write_text(render_chapter(repo_meta, tech_json, audit_json, narrative), encoding="utf-8")
-        state[full_name] = {"status": "done", "pushed_at": repo_meta.get("pushed_at"), "analyzed_at": now_iso()}
+        chapter = render_chapter(repo_meta, tech_json, audit_json, narrative, skeleton["languages_text"])
+        chapter_path.write_text(chapter, encoding="utf-8")
+        state[full_name] = {
+            "status": "done",
+            "pushed_at": repo_meta.get("pushed_at"),
+            "analyzed_at": now_iso(),
+            "pipeline_version": PIPELINE_VERSION,
+        }
         return "done"
     except Exception as exc:
         logging.exception("LLM analysis failed for %s", full_name)
